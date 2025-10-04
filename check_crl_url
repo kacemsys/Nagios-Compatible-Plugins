@@ -1,0 +1,296 @@
+#!/usr/bin/perl -w
+#
+# ==============================================================================
+#  check_crl_url - Nagios / Opsview Plugin
+# ==============================================================================
+#
+#  Author    : Aboulkacem Kradra
+#  Version   : 2.0.0
+#  Date      : 2025-09-26
+#
+#  Description:
+#    This Nagios-compatible plugin monitors the validity of a Certificate
+#    Revocation List (CRL) downloaded via HTTP or HTTPS.
+#
+#    It supports two monitoring modes:
+#      - remain  : Time remaining until CRL expiration (Next Update)
+#      - elapsed : Time elapsed since last CRL update (Last Update)
+#
+#    Human-readable time output example:
+#      "0 days, 15 hours, 23 minutes, 10 seconds"
+#
+#  Dependencies:
+#    - curl or wget (to fetch CRL)
+#    - openssl (to parse CRL fields)
+#
+#  Example Usage:
+#    check_crl_url -H example.com -p /path/to/crl.pem -s -t d -w 3 -c 1 -M remain
+#
+# ==============================================================================
+
+use strict;
+use warnings;
+use Getopt::Long;
+use Time::Local;
+
+# ------------------------------------------------------------------------------
+# Global Variables & Constants
+# ------------------------------------------------------------------------------
+
+my $PROGNAME = "check_crl_url";
+my $VERSION  = "2.0.0";
+
+# Nagios-compatible return codes
+my %ERRORS = (
+    'OK'       => 0,
+    'WARNING'  => 1,
+    'CRITICAL' => 2,
+    'UNKNOWN'  => 3,
+);
+
+# ------------------------------------------------------------------------------
+# Command-Line Options
+# ------------------------------------------------------------------------------
+
+my ($opt_H, $opt_p, $opt_w, $opt_c, $opt_s, $opt_t, $opt_M, $opt_d, $opt_V);
+
+GetOptions(
+    "H=s"       => \$opt_H,            # Hostname or IP
+    "p=s"       => \$opt_p,            # CRL path
+    "w=i"       => \$opt_w,            # Warning threshold
+    "c=i"       => \$opt_c,            # Critical threshold
+    "s"         => \$opt_s,            # Use HTTPS (if present)
+    "t=s"       => \$opt_t,            # Unit: d = days, m = minutes
+    "M=s"       => \$opt_M,            # Mode: remain | elapsed
+    "d"         => \$opt_d,            # Debug mode
+    "V|version" => \$opt_V,            # Display version info
+    "help"      => sub { print_usage(); exit $ERRORS{'OK'} },
+) or usage("Invalid options");
+
+# ------------------------------------------------------------------------------
+# Display Version
+# ------------------------------------------------------------------------------
+
+if ($opt_V) {
+    print "$PROGNAME v$VERSION\n";
+    exit $ERRORS{'OK'};
+}
+
+# ------------------------------------------------------------------------------
+# Validate Parameters
+# ------------------------------------------------------------------------------
+
+usage("Missing host (-H)")           unless $opt_H;
+usage("Missing path (-p)")           unless $opt_p;
+usage("Missing warning threshold (-w)") unless defined $opt_w;
+usage("Missing critical threshold (-c)") unless defined $opt_c;
+
+# Set defaults
+$opt_t ||= "d";        # default unit = days
+$opt_M ||= "remain";   # default mode = remain
+
+# Validate parameter values
+usage("Invalid -t value, must be 'd' (days) or 'm' (minutes)") 
+    unless $opt_t =~ /^(d|m)$/;
+
+usage("Invalid -M value, must be 'remain' or 'elapsed'") 
+    unless $opt_M =~ /^(remain|elapsed)$/;
+
+# ------------------------------------------------------------------------------
+# Construct URL & Initialize Debug
+# ------------------------------------------------------------------------------
+
+my $protocol = $opt_s ? "https" : "http";
+my $url      = "${protocol}://$opt_H$opt_p";
+
+debug("Protocol   : $protocol");
+debug("URL        : $url");
+debug("Mode       : $opt_M");
+debug("Thresholds : warn=$opt_w, crit=$opt_c ($opt_t)");
+
+# ------------------------------------------------------------------------------
+# Download CRL File
+# ------------------------------------------------------------------------------
+
+my $temp_file = "/tmp/crl_" . time() . "_$$.crl";
+
+# Attempt download using curl
+my $curl_cmd = "curl -s -k -H 'Host: $opt_H' -H 'User-Agent: $PROGNAME/$VERSION' ".
+               "-H 'Accept: */*' '$url' -o '$temp_file'";
+debug("Executing: $curl_cmd");
+system($curl_cmd);
+
+# If curl fails, fallback to wget
+unless (-s $temp_file) {
+    my $wget_cmd = "wget --no-check-certificate ".
+                   "--header='Host: $opt_H' ".
+                   "--header='User-Agent: $PROGNAME/$VERSION' ".
+                   "--header='Accept: */*' -O '$temp_file' '$url' 2>/dev/null";
+    debug("Curl failed — attempting wget");
+    debug("Executing: $wget_cmd");
+    system($wget_cmd);
+}
+
+# Exit if download failed
+unless (-s $temp_file) {
+    print "UNKNOWN: Failed to download CRL from $url\n";
+    exit $ERRORS{'UNKNOWN'};
+}
+
+# ------------------------------------------------------------------------------
+# Parse CRL File
+# ------------------------------------------------------------------------------
+
+# Try parsing CRL in DER format, then fallback to PEM
+my $crl_text = qx(/usr/bin/openssl crl -inform DER -noout -text -in "$temp_file" 2>/dev/null);
+$crl_text  ||= qx(/usr/bin/openssl crl -inform PEM -noout -text -in "$temp_file" 2>/dev/null);
+
+unlink $temp_file;
+
+# Check if CRL was successfully parsed
+unless ($crl_text) {
+    print "UNKNOWN: Unable to parse CRL (possibly invalid format)\n";
+    exit $ERRORS{'UNKNOWN'};
+}
+
+# Extract update timestamps
+my ($last_update) = $crl_text =~ /Last Update:\s*(.+)/;
+my ($next_update) = $crl_text =~ /Next Update:\s*(.+)/;
+
+unless ($last_update && $next_update) {
+    print "UNKNOWN: Could not extract CRL update dates\n";
+    exit $ERRORS{'UNKNOWN'};
+}
+
+debug("Last Update : $last_update");
+debug("Next Update : $next_update");
+
+# ------------------------------------------------------------------------------
+# Compute Time Metrics
+# ------------------------------------------------------------------------------
+
+my $last_epoch  = to_epoch($last_update);
+my $next_epoch  = to_epoch($next_update);
+my $now         = time();
+
+my $age_seconds    = $now - $last_epoch;
+my $remain_seconds = $next_epoch - $now;
+
+my $age_hr    = format_time($age_seconds);
+my $remain_hr = format_time($remain_seconds);
+
+# ------------------------------------------------------------------------------
+# Determine Status
+# ------------------------------------------------------------------------------
+
+my $state  = "OK";
+my $output = "";
+
+if ($opt_M eq "elapsed") {
+    # Check time elapsed since last update
+    my $age_val = ($opt_t eq "m") ? int($age_seconds / 60) : int($age_seconds / 86400);
+
+    if ($age_val >= $opt_c) {
+        $state = "CRITICAL";
+    } elsif ($age_val >= $opt_w) {
+        $state = "WARNING";
+    }
+
+    $output = sprintf(
+        "%s: CRL age = %s (warn=%d, crit=%d %s); remaining = %s",
+        $state, $age_hr, $opt_w, $opt_c, $opt_t, $remain_hr
+    );
+
+} else {
+    # Check time remaining until next update
+    my $remain_val = ($opt_t eq "m") ? int($remain_seconds / 60) : int($remain_seconds / 86400);
+
+    if ($remain_val <= $opt_c) {
+        $state = "CRITICAL";
+    } elsif ($remain_val <= $opt_w) {
+        $state = "WARNING";
+    }
+
+    $output = sprintf(
+        "%s: CRL remaining = %s (warn=%d, crit=%d %s); age = %s",
+        $state, $remain_hr, $opt_w, $opt_c, $opt_t, $age_hr
+    );
+}
+
+# ------------------------------------------------------------------------------
+# Output Result & Exit
+# ------------------------------------------------------------------------------
+
+print "$output\n";
+exit $ERRORS{$state};
+
+# ------------------------------------------------------------------------------
+# Helper Functions
+# ------------------------------------------------------------------------------
+
+# Prints usage information and exits
+sub usage {
+    my $msg = shift;
+    print "ERROR: $msg\n" if $msg;
+    print_usage();
+    exit $ERRORS{'UNKNOWN'};
+}
+
+# Displays usage syntax
+sub print_usage {
+    print <<"USAGE";
+Usage:
+  $PROGNAME -H <host> -p <path> [-s] -t <d|m> -w <warn> -c <crit> -M <remain|elapsed> [-d] [-V|--version]
+
+Options:
+  -H STRING   Hostname or IP address
+  -p STRING   Path to CRL (e.g. /certs/mycrl.crl)
+  -s          Use HTTPS (default: HTTP)
+  -t STRING   Time unit: d=days, m=minutes (default: d)
+  -w INT      Warning threshold
+  -c INT      Critical threshold
+  -M STRING   Mode: remain | elapsed (default: remain)
+  -d          Enable debug output
+  -V          Display version
+  --help      Show this help message
+USAGE
+}
+
+# Conditional debug logging
+sub debug {
+    my $msg = shift;
+    print "DEBUG: $msg\n" if $opt_d;
+}
+
+# Convert seconds into a readable time string
+sub format_time {
+    my $seconds = shift;
+    return "0 seconds" if $seconds <= 0;
+
+    my $days    = int($seconds / 86400); $seconds -= $days * 86400;
+    my $hours   = int($seconds / 3600);  $seconds -= $hours * 3600;
+    my $minutes = int($seconds / 60);    $seconds -= $minutes * 60;
+
+    my @parts;
+    push @parts, "$days days"       if $days;
+    push @parts, "$hours hours"     if $hours;
+    push @parts, "$minutes minutes" if $minutes;
+    push @parts, "$seconds seconds" if $seconds;
+
+    return join(", ", @parts);
+}
+
+# Convert CRL date string to epoch seconds
+sub to_epoch {
+    my $date_str = shift;
+
+    # Expected format: "Sep 26 12:00:00 2025 GMT"
+    my ($mon, $day, $time, $year) = $date_str =~ /^(\w+)\s+(\d+)\s+(\d+:\d+:\d+)\s+(\d{4})/;
+    my %months = (
+        Jan => 0, Feb => 1, Mar => 2, Apr => 3, May => 4, Jun => 5,
+        Jul => 6, Aug => 7, Sep => 8, Oct => 9, Nov => 10, Dec => 11,
+    );
+    my ($h, $m, $s) = split(/:/, $time);
+
+    return timegm($s, $m, $h, $day, $months{$mon}, $year - 1900);
+}
