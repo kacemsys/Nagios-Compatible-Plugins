@@ -24,7 +24,7 @@
 #    - openssl (to parse CRL fields)
 #
 #  Example Usage:
-#    check_crl_url -H example.com -p /path/to/crl.pem -s -t d -w 3 -c 1 -M remain
+#    check_crl_url -H example.com -p /path/to/crl.crl -s -t d -w 3 -c 1 -M remain
 #
 # ==============================================================================
 
